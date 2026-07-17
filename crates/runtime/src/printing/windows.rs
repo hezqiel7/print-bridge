@@ -15,6 +15,12 @@ use windows_sys::Win32::Graphics::Printing::{
     ClosePrinter, EndDocPrinter, EndPagePrinter, OpenPrinterW, StartDocPrinterW, StartPagePrinter,
     WritePrinter, DOC_INFO_1W, PRINTER_HANDLE,
 };
+use windows_sys::Win32::{
+    Foundation::POINT,
+    Storage::Xps::{DeviceCapabilitiesW, DC_PAPERNAMES, DC_PAPERS, DC_PAPERSIZE},
+};
+
+const PAPER_NAME_LENGTH: usize = 64;
 
 /// Windows 打印后端：用 PowerShell 发现打印机，用 SumatraPDF 执行打印。
 #[derive(Debug, Clone)]
@@ -62,10 +68,17 @@ impl PrintBackend for WindowsPrintBackend {
         parse_printers_json(&String::from_utf8_lossy(&output.stdout))
     }
 
-    /// 确认打印机存在后返回常见标签纸尺寸。
+    /// 返回打印机驱动报告的纸张尺寸，并在驱动不支持查询时使用常见标签纸尺寸。
     fn list_papers(&self, printer_name: &str) -> PrintResult<Vec<PaperInfo>> {
-        ensure_printer_exists(self, printer_name)?;
-        Ok(common_label_papers())
+        let printer = self
+            .list_printers()?
+            .into_iter()
+            .find(|printer| printer.name == printer_name)
+            .ok_or_else(|| PrintError::PrinterNotFound(printer_name.to_string()))?;
+
+        Ok(query_printer_papers(printer_name, printer.port.as_deref())
+            .filter(|papers| !papers.is_empty())
+            .unwrap_or_else(common_label_papers))
     }
 
     /// 使用明确的打印机和纸张设置把 PDF 发送给 SumatraPDF。
@@ -183,6 +196,116 @@ fn wide_null(value: &str) -> Vec<u16> {
     OsStr::new(value)
         .encode_wide()
         .chain(std::iter::once(0))
+        .collect()
+}
+
+/// 查询 Windows 打印驱动报告的纸张名称和物理尺寸。
+fn query_printer_papers(printer_name: &str, port_name: Option<&str>) -> Option<Vec<PaperInfo>> {
+    let papers = query_printer_papers_for_port(printer_name, port_name);
+    if papers.as_ref().is_some_and(|papers| !papers.is_empty()) || port_name.is_none() {
+        return papers;
+    }
+    query_printer_papers_for_port(printer_name, None)
+}
+
+/// 使用指定的打印驱动端口查询纸张能力。
+fn query_printer_papers_for_port(
+    printer_name: &str,
+    port_name: Option<&str>,
+) -> Option<Vec<PaperInfo>> {
+    let printer_name_w = wide_null(printer_name);
+    let port_name_w = port_name.map(wide_null);
+    let port = port_name_w
+        .as_ref()
+        .map_or(ptr::null(), |value| value.as_ptr());
+
+    let count = unsafe {
+        DeviceCapabilitiesW(
+            printer_name_w.as_ptr(),
+            port,
+            DC_PAPERS,
+            ptr::null_mut(),
+            ptr::null(),
+        )
+    };
+    if count <= 0 {
+        return None;
+    }
+
+    let count = count as usize;
+    let mut ids = vec![0_u16; count];
+    let mut sizes = vec![POINT { x: 0, y: 0 }; count];
+    let mut names = vec![0_u16; count * PAPER_NAME_LENGTH];
+
+    let ids_count = unsafe {
+        DeviceCapabilitiesW(
+            printer_name_w.as_ptr(),
+            port,
+            DC_PAPERS,
+            ids.as_mut_ptr(),
+            ptr::null(),
+        )
+    };
+    let sizes_count = unsafe {
+        DeviceCapabilitiesW(
+            printer_name_w.as_ptr(),
+            port,
+            DC_PAPERSIZE,
+            sizes.as_mut_ptr().cast(),
+            ptr::null(),
+        )
+    };
+    let names_count = unsafe {
+        DeviceCapabilitiesW(
+            printer_name_w.as_ptr(),
+            port,
+            DC_PAPERNAMES,
+            names.as_mut_ptr(),
+            ptr::null(),
+        )
+    };
+    if ids_count <= 0 || sizes_count <= 0 || names_count <= 0 {
+        return None;
+    }
+
+    let count = count
+        .min(ids_count as usize)
+        .min(sizes_count as usize)
+        .min(names_count as usize);
+    Some(paper_infos_from_capabilities(
+        &ids[..count],
+        &sizes[..count],
+        &names,
+        count,
+    ))
+}
+
+/// 将 Windows 纸张能力转换为共享纸张尺寸。
+fn paper_infos_from_capabilities(
+    ids: &[u16],
+    sizes: &[POINT],
+    names: &[u16],
+    count: usize,
+) -> Vec<PaperInfo> {
+    (0..count)
+        .filter_map(|index| {
+            let name_start = index * PAPER_NAME_LENGTH;
+            let name = String::from_utf16_lossy(&names[name_start..name_start + PAPER_NAME_LENGTH])
+                .trim_end_matches('\0')
+                .trim()
+                .to_string();
+            let width_mm = f64::from(sizes[index].x) / 10.0;
+            let height_mm = f64::from(sizes[index].y) / 10.0;
+            if name.is_empty() || width_mm <= 0.0 || height_mm <= 0.0 {
+                return None;
+            }
+            Some(PaperInfo {
+                id: format!("windows_paper_{}", ids[index]),
+                name,
+                width_mm,
+                height_mm,
+            })
+        })
         .collect()
 }
 
@@ -366,7 +489,7 @@ fn command_error(command: &str, message: String) -> PrintError {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_printers_json;
+    use super::{paper_infos_from_capabilities, parse_printers_json, PAPER_NAME_LENGTH, POINT};
 
     #[test]
     fn parse_printers_json_accepts_null_default_flag() {
@@ -378,5 +501,33 @@ mod tests {
         assert_eq!(printers.len(), 1);
         assert!(!printers[0].is_default);
         assert_eq!(printers[0].name, "Printer A");
+    }
+
+    #[test]
+    fn parses_driver_paper_capabilities_into_millimeters() {
+        let mut names = vec![0_u16; PAPER_NAME_LENGTH * 2];
+        for (slot, value) in names[..6].iter_mut().zip("Letter".encode_utf16()) {
+            *slot = value;
+        }
+        for (slot, value) in names[PAPER_NAME_LENGTH..PAPER_NAME_LENGTH + 2]
+            .iter_mut()
+            .zip("A4".encode_utf16())
+        {
+            *slot = value;
+        }
+
+        let papers = paper_infos_from_capabilities(
+            &[1, 9],
+            &[POINT { x: 2159, y: 2794 }, POINT { x: 2100, y: 2970 }],
+            &names,
+            2,
+        );
+
+        assert_eq!(papers[0].id, "windows_paper_1");
+        assert_eq!(papers[0].name, "Letter");
+        assert_eq!(papers[0].width_mm, 215.9);
+        assert_eq!(papers[0].height_mm, 279.4);
+        assert_eq!(papers[1].width_mm, 210.0);
+        assert_eq!(papers[1].height_mm, 297.0);
     }
 }
